@@ -44,6 +44,7 @@
 // local includes
 #include "capture_generation.h"
 #include "config.h"
+#include "game_profiles.h"
 #include "audio.h"
 #include "platform/common.h"
 #include "rtsp.h"
@@ -103,6 +104,11 @@ namespace proc {
         ::close(fd);
       }
     }
+  };
+
+  struct profile_writer_cleanup_t {
+    std::vector<pidfd_handle_t> handles;
+    bool captured = false;
   };
 #endif
 
@@ -166,6 +172,7 @@ namespace proc {
 
 #if defined(POLARIS_TESTS) && defined(__linux__)
 
+  bool game_profile_group_stopped_for_tests(boost::process::v1::group &group, bool signal);
   bool should_reprobe_deferred_cage_encoder_for_tests(
     bool use_cage_compositor,
     bool no_active_sessions_at_launch,
@@ -550,6 +557,7 @@ namespace proc {
    */
   struct ctx_t {
     std::vector<cmd_t> prep_cmds;
+    std::vector<game_profiles::profile_t> game_profiles;
     std::vector<cmd_t> state_cmds;
 
     /**
@@ -865,6 +873,9 @@ namespace proc {
     );
 #endif
 #if defined(POLARIS_TESTS)
+    void use_disposable_process_fixture_for_tests() { session_devices_enabled = false; }
+    void set_game_profile_capture_failure_for_tests(bool fail);
+    bool game_profile_pending_for_tests() const { return _pending_game_profile.has_value(); }
     void set_active_launch_for_tests(
       const ctx_t &app,
       std::shared_ptr<rtsp_stream::launch_session_t> launch_session
@@ -892,6 +903,26 @@ namespace proc {
       bool no_active_sessions_at_launch
     );
     void terminate_impl(bool immediate, bool needs_refresh);
+#ifdef POLARIS_TESTS
+    bool session_devices_enabled = true;
+#else
+    static constexpr bool session_devices_enabled = true;
+#endif
+    bool apply_game_profile(const rtsp_stream::launch_session_t &session, bool private_runtime = false);
+    bool cleanup_game_profile(bool writers_stopped);
+
+    struct pending_game_profile_t {
+      game_profiles::transaction_t settings;
+      boost::process::v1::group infrastructure_undo_group;
+      bool cleanup_started = false;
+      bool writers_stopped = false;
+#ifdef __linux__
+      bool generation_prerequisites_stopped = false;
+      profile_writer_cleanup_t steam_writers;
+      profile_writer_cleanup_t gamescope_writers;
+#endif
+    };
+    std::optional<pending_game_profile_t> _pending_game_profile;
 #ifdef __linux__
     bool request_session_owned_steam_graceful_shutdown_before_cage_stop();
     bool terminate_session_owned_steam_before_cage_stop();

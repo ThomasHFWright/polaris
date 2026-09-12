@@ -122,6 +122,8 @@ set(POLARIS_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/game_classifier.cpp"
         "${CMAKE_SOURCE_DIR}/src/beat_times.h"
         "${CMAKE_SOURCE_DIR}/src/beat_times.cpp"
+        "${CMAKE_SOURCE_DIR}/src/game_profiles.cpp"
+        "${CMAKE_SOURCE_DIR}/src/game_profiles.h"
         "${CMAKE_SOURCE_DIR}/src/game_library_scanner.h"
         "${CMAKE_SOURCE_DIR}/src/game_library_scanner.cpp"
         "${CMAKE_SOURCE_DIR}/src/game_artwork.h"

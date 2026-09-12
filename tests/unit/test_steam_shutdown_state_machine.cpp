@@ -419,9 +419,9 @@ TEST(SteamShutdownStateMachineTests, EmptySteamAppRootStillUsesPinnedStopBarrier
     "bool quiesce_session_owned_steam_app_before_native_shutdown(\n"
     "      const proc::ctx_t &app,\n"
     "      std::string_view session_instance_id,\n"
-    "      const boost::process::v1::environment &env\n"
-    "    ) {\n"
-    "      const auto appid",
+    "      const boost::process::v1::environment &env,\n"
+    "      profile_writer_cleanup_t *profile_cleanup\n"
+    "    ) {",
     "bool dispatch_steam_big_picture_action("
   );
   ASSERT_FALSE(quiescence.empty());

@@ -2572,20 +2572,23 @@ TEST(ProcessRuntimeConfigTests, ExactGenerationCleanupLeavesUnownedControlProces
     return;
   }
 
-  const auto owned_environ = "/proc/" + std::to_string(owned) + "/environ";
-  bool token_visible = false;
-  for (int i = 0; i < 40 && !token_visible; ++i) {
-    std::ifstream in(owned_environ, std::ios::binary);
-    const std::string environ((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    token_visible = environ.find("POLARIS_SESSION_INSTANCE_ID=" + token) != std::string::npos;
-    if (!token_visible) {
+  const auto sleep_ready = [&](pid_t child, bool owned) {
+    const auto path = "/proc/" + std::to_string(child);
+    const auto cmdline = file_handler::read_file((path + "/cmdline").c_str());
+    const auto environ = file_handler::read_file((path + "/environ").c_str());
+    return cmdline == std::string("sleep\0" "60\0", 9) && !environ.empty() &&
+           (environ.find("POLARIS_SESSION_INSTANCE_ID=" + token) != std::string::npos) == owned;
+  };
+  // Both children must finish exec: an unowned child in the transient empty
+  // environ window is correctly ambiguous to the conservative ownership scan.
+  bool children_ready = false;
+  for (int i = 0; i < 40 && !children_ready; ++i) {
+    children_ready = sleep_ready(owned, true) && sleep_ready(control, false);
+    if (!children_ready) {
       std::this_thread::sleep_for(std::chrono::milliseconds(25));
     }
   }
-  if (!token_visible) {
-    FAIL() << "exact generation token did not become visible in child environ";
-    return;
-  }
+  ASSERT_TRUE(children_ready) << "both sleep children must finish exec with their expected ownership";
 
   EXPECT_TRUE(proc::terminate_exact_generation_processes_for_tests(token));
 
@@ -3460,8 +3463,8 @@ TEST(ProcessRuntimeConfigTests, SessionOwnedSteamUsesExactGenerationPidfdsBefore
   const auto legacy_detach_gate = terminate.find(
     "isolated_session_detaches_legacy_handles("
   );
-  const auto detach_legacy_child = terminate.find("_process.detach();");
-  const auto detach_legacy_group = terminate.find("_process_group.detach();");
+  const auto detach_legacy_child = terminate.find("_process.detach();", legacy_detach_gate);
+  const auto detach_legacy_group = terminate.find("_process_group.detach();", legacy_detach_gate);
   const auto clear_legacy_child = terminate.find("_process = boost::process::v1::child();");
   const auto immutable_undo_guard = terminate.find("_session_used_cage_compositor", clear_legacy_child);
   const auto finish_generation = terminate.find("finish_isolated_session_generation_cleanup();");
@@ -3539,6 +3542,23 @@ TEST(ProcessRuntimeConfigTests, SessionOwnedSteamUsesExactGenerationPidfdsBefore
   const auto cleanup_result = generation_cleanup.find(
     "const bool isolated_cleanup_complete = terminate_isolated_session_processes("
   );
+  const auto profile_retry_proof = generation_cleanup.find(
+    "std::exchange(_pending_game_profile->generation_prerequisites_stopped, false)"
+  );
+  const auto profile_retry_result = generation_cleanup.find(
+    "_exact_generation_cleanup_complete = isolated_cleanup_complete && detached_authority_complete;",
+    profile_retry_proof
+  );
+  ASSERT_NE(profile_retry_proof, std::string::npos);
+  ASSERT_NE(profile_retry_result, std::string::npos);
+  EXPECT_LT(cleanup_result, profile_retry_proof);
+  const auto clear_profile_proof = terminate.find("generation_prerequisites_stopped = false;");
+  const auto establish_profile_proof = terminate.find("generation_prerequisites_stopped = true;");
+  ASSERT_NE(clear_profile_proof, std::string::npos);
+  ASSERT_NE(establish_profile_proof, std::string::npos);
+  EXPECT_LT(clear_profile_proof, terminate_attached);
+  EXPECT_LT(terminate_private_steam, establish_profile_proof);
+  EXPECT_LT(establish_profile_proof, terminate_generation);
   const auto cleanup_success_gate = generation_cleanup.find("isolated_session_cleanup_resets_router(");
   const auto reset_runtime = generation_cleanup.find("finalize_isolated_session_runtime(true)");
   const auto retain_generation = generation_cleanup.find(

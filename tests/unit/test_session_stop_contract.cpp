@@ -1038,7 +1038,9 @@ TEST(SessionStopContractTests, TerminateImplStopsBrowserCaptureBeforeIsolatedKil
   ASSERT_FALSE(source.empty());
   const auto start = source.find("void proc_t::terminate_impl(");
   ASSERT_NE(start, std::string::npos);
-  const auto body = source.substr(start, 3500);
+  const auto end = source.find("bool proc_t::reload_configuration_from_file(", start);
+  ASSERT_NE(end, std::string::npos);
+  const auto body = source.substr(start, end - start);
   const auto prepare = body.find("session_media::prepare_for_stop(");
   const auto kill = body.find("terminate_isolated_session_generation(");
   ASSERT_NE(prepare, std::string::npos);
@@ -1135,13 +1137,18 @@ TEST(SessionStopContractTests, CompositorTerminationRetainsRootMediaFenceUntilCl
   ASSERT_FALSE(process.empty());
   const auto terminate = process.find("void proc_t::terminate_impl(");
   ASSERT_NE(terminate, std::string::npos);
-  const auto terminate_body = process.substr(terminate, 4200);
+  const auto terminate_end = process.find("bool proc_t::reload_configuration_from_file(", terminate);
+  ASSERT_NE(terminate_end, std::string::npos);
+  const auto terminate_body = process.substr(terminate, terminate_end - terminate);
   // Function-scoped holder so the fence outlives early #ifdef blocks through undo.
   const auto fence = terminate_body.find("media_stop.fence = session_media::prepare_for_stop()");
   const auto compositor_stop = terminate_body.find("terminate_isolated_session_generation()");
+  const auto release = terminate_body.find("media_stop.fence.reset()");
   ASSERT_NE(fence, std::string::npos);
   ASSERT_NE(compositor_stop, std::string::npos);
+  ASSERT_NE(release, std::string::npos);
   EXPECT_LT(fence, compositor_stop);
+  EXPECT_LT(compositor_stop, release);
 }
 
 TEST(SessionStopContractTests, DuplicateStopIsRejectedWhileStopIsInProgress) {

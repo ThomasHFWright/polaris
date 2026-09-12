@@ -54,6 +54,8 @@ namespace rtsp_stream {
 
     std::string device_name;
     std::string unique_id;
+    // Set only by authenticated /launch, never from request parameters or web launch.
+    bool paired_app_launch = false;
     // Explicit deterministic launch preset. This is never populated from
     // Doctor history or AI output.
     std::string profile_preference = "auto";

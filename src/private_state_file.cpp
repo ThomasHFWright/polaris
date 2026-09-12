@@ -479,7 +479,7 @@ namespace private_state_file {
   }  // namespace
 
   static read_result_t read_locked(const directory_handle_t &directory, std::size_t max_bytes,
-                                   bool permit_public_read) {
+                                   bool permit_public_read, mode_t *permissions = nullptr) {
     int flags = O_RDONLY | O_NONBLOCK;
 #ifdef O_CLOEXEC
     flags |= O_CLOEXEC;
@@ -519,6 +519,7 @@ namespace private_state_file {
       return {.status = read_status_e::rejected};
     }
 
+    if (permissions) *permissions = metadata.st_mode & 0777;
     std::string payload(static_cast<std::size_t>(metadata.st_size), '\0');
     std::size_t offset = 0;
     while (offset < payload.size()) {
@@ -551,7 +552,8 @@ namespace private_state_file {
     return {.status = read_status_e::ok, .payload = std::move(payload)};
   }
 
-  static write_result_t write_locked(directory_handle_t &directory, std::string_view payload) {
+  static write_result_t write_locked(directory_handle_t &directory, std::string_view payload,
+                                     mode_t permissions = S_IRUSR | S_IWUSR) {
 #ifdef POLARIS_TESTS
     const auto injected_fault = write_fault.load(std::memory_order_relaxed);
     if (injected_fault == write_fault_e::open) {
@@ -581,7 +583,7 @@ namespace private_state_file {
         temporary_exists = false;
       }
     };
-    if (::fchmod(descriptor, S_IRUSR | S_IWUSR) != 0) {
+    if (::fchmod(descriptor, permissions) != 0) {
       cleanup();
       return {write_status_e::not_committed};
     }
@@ -689,17 +691,18 @@ namespace private_state_file {
 
   write_result_t update_atomic(const std::filesystem::path &target, std::size_t max_bytes,
       const std::function<std::optional<std::string>(const read_result_t &)> &update,
-      bool permit_public_read) {
+      bool permit_public_read, bool preserve_permissions) {
     directory_handle_t directory {target, true};
     if (!directory) return {write_status_e::not_committed};
     state_file_lock_t lock {directory, false};
     if (!lock) return {write_status_e::not_committed};
-    const auto current = read_locked(directory, max_bytes, permit_public_read);
+    mode_t permissions = S_IRUSR | S_IWUSR;
+    const auto current = read_locked(directory, max_bytes, permit_public_read,
+                                     preserve_permissions ? &permissions : nullptr);
     if (!current && current.status != read_status_e::missing) return {write_status_e::not_committed};
     const auto next = update(current);
     if (!next || next->size() > max_bytes) return {write_status_e::not_committed};
-    if (current && *next == current.payload) return {write_status_e::committed};
-    return write_locked(directory, *next);
+    return write_locked(directory, *next, permissions);
   }
 
 #ifdef POLARIS_TESTS

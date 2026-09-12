@@ -617,6 +617,7 @@
     </div>
 
     <!-- Edit form -->
+    <p v-if="showEditForm && saveError" role="alert" class="text-sm text-danger break-words">{{ saveError }}</p>
     <section v-if="showEditForm" class="app-editor-layout">
       <div class="app-editor-main">
         <section class="section-card app-editor-card app-editor-section">
@@ -838,6 +839,71 @@
           ></Checkbox>
 
           <div class="app-editor-automation-stack">
+            <details id="appGameProfiles" class="app-editor-inline-disclosure" :open="showGameProfiles">
+              <summary class="focus-ring flex flex-wrap items-center gap-2" @click.prevent="showGameProfiles = !showGameProfiles">
+                <span>Game settings profiles</span>
+                <span class="control-chip">{{ editGameProfiles.length }}</span>
+              </summary>
+              <div class="app-editor-disclosure-body">
+                <p class="text-xs leading-5 text-storm">
+                  Client-specific profiles win over any-client profiles, then resolution + FPS, resolution, or no mode.
+                  FPS accepts up to three decimals; the server rounds to the nearest whole number and rejects duplicate selectors.
+                  Edit named options in Cyberpunk's UserSettings.json before launch; restore the edited fields after the game stops.
+                  Empty settings ({}) select a no-op. File paths support $(HOME) at launch.
+                </p>
+                <fieldset v-for="(profile, i) in editGameProfiles" :key="i" class="min-w-0 space-y-3 rounded-lg border border-storm/15 p-3" data-game-profile>
+                  <legend class="px-1 text-sm text-silver">Profile {{ i + 1 }}</legend>
+                  <div class="grid min-w-0 gap-3 sm:grid-cols-2">
+                    <div v-for="field in gameProfileFields" :key="field.key" class="min-w-0">
+                      <label :for="`gameProfile-${i}-${field.key}`" class="settings-field-label block">{{ field.label }}</label>
+                      <input
+                        :id="`gameProfile-${i}-${field.key}`"
+                        v-model="profile[field.key]"
+                        type="text"
+                        :inputmode="field.inputmode"
+                        class="app-editor-input"
+                        :aria-invalid="profileValidationAttempted && Boolean(gameProfileValidation.errors[i]?.[field.key])"
+                        :aria-describedby="profileValidationAttempted && gameProfileValidation.errors[i]?.[field.key] ? `gameProfile-${i}-${field.key}-error` : undefined"
+                      />
+                      <p v-if="profileValidationAttempted && gameProfileValidation.errors[i]?.[field.key]" :id="`gameProfile-${i}-${field.key}-error`" class="text-xs text-danger" role="alert">
+                        {{ gameProfileValidation.errors[i][field.key] }}
+                      </p>
+                    </div>
+                    <div class="min-w-0">
+                      <label :for="`gameProfile-${i}-client`" class="settings-field-label block">Paired client</label>
+                      <select :id="`gameProfile-${i}-client`" v-model="profile['client-uuid']" class="app-editor-input">
+                        <option value="">Any paired client</option>
+                        <option v-if="profile['client-uuid'] && !clients.some(client => client.uuid === profile['client-uuid'])" :value="profile['client-uuid']">
+                          Unavailable — {{ profile['client-uuid'] }}
+                        </option>
+                        <option v-for="client in clients" :key="client.uuid" :value="client.uuid">{{ client.friendly_name || client.name || client.uuid }}</option>
+                      </select>
+                    </div>
+                  </div>
+                  <div class="min-w-0">
+                    <label :for="`gameProfile-${i}-settings`" class="settings-field-label block">Named option edits (JSON)</label>
+                    <p :id="`gameProfile-${i}-settings-help`" class="break-words text-xs leading-5 text-storm">
+                      Use exact option names and existing value or index fields, for example {"DLSS":{"value":"Balanced","index":3},"DLSSFrameGen":{"value":true}}.
+                      Keep each value's JSON type; indices must be nonnegative integers.
+                    </p>
+                    <textarea
+                      :id="`gameProfile-${i}-settings`"
+                      v-model="profile.settings"
+                      rows="6"
+                      spellcheck="false"
+                      class="app-editor-input app-editor-input-mono w-full"
+                      :aria-invalid="profileValidationAttempted && Boolean(gameProfileValidation.errors[i]?.settings)"
+                      :aria-describedby="`gameProfile-${i}-settings-help` + (profileValidationAttempted && gameProfileValidation.errors[i]?.settings ? ` gameProfile-${i}-settings-error` : '')"
+                    ></textarea>
+                    <p v-if="profileValidationAttempted && gameProfileValidation.errors[i]?.settings" :id="`gameProfile-${i}-settings-error`" class="break-words text-xs text-danger" role="alert">
+                      {{ gameProfileValidation.errors[i].settings }}
+                    </p>
+                  </div>
+                  <button type="button" class="app-editor-secondary-button" :aria-label="`Remove game settings profile ${i + 1}`" @click="editGameProfiles.splice(i, 1)">Remove profile</button>
+                </fieldset>
+                <button type="button" class="app-editor-secondary-button" @click="editGameProfiles.push({ name: '', file: '', settings: '{}', 'client-uuid': '', width: '', height: '', fps: '' })">+ Add profile</button>
+              </div>
+            </details>
             <details
               v-for="type in ['prep', 'state']"
               :key="type"
@@ -1056,11 +1122,13 @@ import Checkbox from '../Checkbox.vue'
 import Button from '../components/Button.vue'
 import { useToast } from '../composables/useToast'
 import { useGameScanner } from '../composables/useGameScanner'
+import { useClients } from '../composables/useClients'
 import { filterLibraryApps } from '../library-filters'
 import { isLaunchReadyApp, launchPriorityDetails, quickLaunchApps as buildQuickLaunchApps } from '../library-launch-priority'
 import { filterImportGames, summarizeImportGames } from '../library-imports'
 
 const { toast: showToast } = useToast()
+const { clients, refreshClients } = useClients()
 const {
   scanning: gameScanning, importing: gameImporting,
   steamGames, lutrisGames, heroicGames,
@@ -1094,6 +1162,7 @@ const newAppTemplate = {
   "exit-timeout": 5,
   "prep-cmd": [],
   "state-cmd": [],
+  "game-profiles": [],
   "detached": [],
   "image-path": "",
   "scale-factor": 100,
@@ -1112,6 +1181,53 @@ const coverFinderWrapper = ref(null)
 const showTweaks = ref(false)
 const editEnvVars = ref([])
 const editMangoHud = ref(false)
+const editGameProfiles = computed(() => editForm.value?.['game-profiles'] || [])
+const showGameProfiles = ref(false)
+const profileValidationAttempted = ref(false)
+const saveError = ref('')
+const gameProfileFields = [
+  { key: 'name', label: 'Profile name' },
+  { key: 'file', label: 'Settings file' },
+  { key: 'width', label: 'Width (pixels, optional)', inputmode: 'numeric' },
+  { key: 'height', label: 'Height (pixels, optional)', inputmode: 'numeric' },
+  { key: 'fps', label: 'FPS (optional)', inputmode: 'decimal' },
+]
+const gameProfileValidation = computed(() => {
+  const errors = []
+  const profiles = editGameProfiles.value.map(profile => {
+    const error = {}
+    const row = { name: profile.name.trim(), file: profile.file, settings: {} }
+    try {
+      row.settings = JSON.parse(profile.settings)
+    } catch {
+      error.settings = 'Enter valid JSON with double-quoted names and strings.'
+    }
+    if (profile['client-uuid']) row['client-uuid'] = profile['client-uuid']
+    // Only convert numeric text here; the save endpoint validates profile semantics.
+    for (const key of ['width', 'height', 'fps']) {
+      const text = String(profile[key] ?? '').trim()
+      if (!text) continue
+      const format = key === 'fps' ? /^[0-9]+(?:\.[0-9]{1,3})?$/ : /^[0-9]+$/
+      if (!format.test(text) || !Number.isFinite(Number(text))) {
+        error[key] = key === 'fps' ? 'Enter FPS with at most 3 decimal places.' : 'Enter a whole number.'
+      } else row[key] = Number(text)
+    }
+    errors.push(error)
+    return row
+  })
+  return { profiles, errors, valid: errors.every(error => Object.keys(error).length === 0) }
+})
+
+function resetGameProfiles() {
+  for (const profile of editGameProfiles.value) {
+    profile['client-uuid'] ||= ''
+    profile.settings = JSON.stringify(profile.settings, null, 2)
+  }
+  showGameProfiles.value = editGameProfiles.value.length > 0
+  profileValidationAttempted.value = false
+  saveError.value = ''
+  refreshClients()
+}
 
 // Reactive state
 const apps = ref([])
@@ -1437,7 +1553,8 @@ function loadApps() {
 }
 
 function newApp() {
-  editForm.value = Object.assign({}, newAppTemplate)
+  editForm.value = JSON.parse(JSON.stringify(newAppTemplate))
+  resetGameProfiles()
   editEnvVars.value = []
   editMangoHud.value = false
   showTweaks.value = false
@@ -1497,7 +1614,8 @@ function closeApp(options = {}) {
 }
 
 function editApp(app) {
-  editForm.value = Object.assign({}, newAppTemplate, JSON.parse(JSON.stringify(app)))
+  editForm.value = JSON.parse(JSON.stringify({ ...newAppTemplate, ...app }))
+  resetGameProfiles()
   // Populate env vars editor from the app's env object
   const envObj = app.env || {}
   editMangoHud.value = envObj['MANGOHUD'] === '1'
@@ -1621,6 +1739,14 @@ function useCover(cover) {
 }
 
 function save() {
+  if (actionDisabled.value) return
+  saveError.value = ''
+  profileValidationAttempted.value = true
+  if (!gameProfileValidation.value.valid) {
+    showGameProfiles.value = true
+    saveError.value = 'Check the game settings profile fields.'
+    return
+  }
   editForm.value.name = editForm.value.name.trim()
   if (!editForm.value.name) return
   editForm.value["exit-timeout"] = parseInt(editForm.value["exit-timeout"]) || 5
@@ -1636,22 +1762,28 @@ function save() {
   delete editForm.value.id
   delete editForm.value.launching
   delete editForm.value.dragover
-  fetch("./api/apps", {
+  actionDisabled.value = true
+  return fetch("./api/apps", {
     credentials: 'include',
     headers: { 'Content-Type': 'application/json' },
     method: 'POST',
-    body: JSON.stringify(editForm.value),
-  }).then((r) => r.json())
-  .then((r) => {
-    if (!r.status) {
-      showToast(i18n.t('apps.save_failed') + r.error, 'error')
-      throw new Error(`App save failed: ${r.error}`)
+    body: JSON.stringify({ ...editForm.value, 'game-profiles': gameProfileValidation.value.profiles }),
+  }).then(async response => {
+    const result = await response.json()
+    if (response.ok === false || !result.status) {
+      throw new Error(result.error || i18n.t('apps.save_failed'))
     }
   })
   .then(() => {
     showEditForm.value = false
     loadApps()
   })
+  .catch(error => {
+    saveError.value = error.message
+    showGameProfiles.value = true
+    showToast(i18n.t('apps.save_failed') + error.message, 'error')
+  })
+  .finally(() => { actionDisabled.value = false })
 }
 
 // created() logic
