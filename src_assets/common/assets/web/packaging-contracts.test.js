@@ -833,12 +833,16 @@ describe('Linux packaging contracts', () => {
     expect(releaseVerifier).not.toContain('supported_count')
   })
 
-  it('keeps unpublished candidate sourcing explicit, local-only, and absent from CI', () => {
+  it('keeps unpublished candidate sourcing explicit, local-only, and fork-gated in CI', () => {
     const workflow = readSource('.github/workflows/build.yml')
     const bootstrap = readSource('scripts/ci/run-steamos-build.sh')
     const buildScript = readSource('scripts/ci/build-steamos-package.sh')
 
-    expect(workflow).not.toContain('POLARIS_LOCAL_CANDIDATE_BUILD')
+    expect(workflow.split('\n')
+      .filter(line => line.includes('POLARIS_LOCAL_CANDIDATE_BUILD'))
+      .map(line => line.trim())).toEqual([
+      "--env \"POLARIS_LOCAL_CANDIDATE_BUILD=${{ github.repository != 'papi-ux/polaris' && '1' || '0' }}\" \\",
+    ])
     for (const script of [bootstrap, buildScript]) {
       const commands = normalizedShellCommands(script)
       expect(commands).toContain('POLARIS_LOCAL_CANDIDATE_BUILD="${POLARIS_LOCAL_CANDIDATE_BUILD-0}"')

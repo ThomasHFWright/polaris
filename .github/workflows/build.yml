@@ -866,6 +866,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/polaris-steamos-output"
           sudo docker run --privileged --rm \
             --env "POLARIS_BUILD_COMMIT=$POLARIS_BUILD_COMMIT" \
+            --env "POLARIS_LOCAL_CANDIDATE_BUILD=${{ github.repository != 'papi-ux/polaris' && '1' || '0' }}" \
             --volume "$GITHUB_WORKSPACE:/workspace:rw" \
             --volume "$RUNNER_TEMP/polaris-steamos-output:/output:rw" \
             archlinux:latest \
