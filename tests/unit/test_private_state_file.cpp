@@ -826,3 +826,45 @@ TEST_F(PrivateStateFileTest, RefusalNamesTheDirectoryThatFailedAndItsOwnRemedy) 
     << captured;
 }
 #endif
+
+#if defined(__linux__)
+TEST_F(PrivateStateFileTest, UpdateCanPreservePermissionsWithoutChangingPrivateDefaults) {
+  ASSERT_TRUE(private_state_file::write_atomic(target, "original"));
+  ASSERT_EQ(::chmod(target.c_str(), 0640), 0);
+  const auto update = [](const auto &) { return std::optional<std::string>("preserved"); };
+  ASSERT_TRUE(private_state_file::update_atomic(target, 1024, update, true, true));
+  struct stat metadata {};
+  ASSERT_EQ(::stat(target.c_str(), &metadata), 0);
+  EXPECT_EQ(metadata.st_mode & 0777, 0640);
+  private_state_file::set_write_fault_for_tests(private_state_file::write_fault_e::rename);
+  EXPECT_FALSE(private_state_file::update_atomic(target, 1024,
+    [](const auto &) { return std::optional<std::string>("failed"); }, true, true));
+  private_state_file::set_write_fault_for_tests(private_state_file::write_fault_e::none);
+  EXPECT_EQ(private_state_file::read_secure(target, 1024, true).payload, "preserved");
+  ASSERT_EQ(::stat(target.c_str(), &metadata), 0);
+  EXPECT_EQ(metadata.st_mode & 0777, 0640);
+  ASSERT_TRUE(private_state_file::update_atomic(target, 1024,
+    [](const auto &) { return std::optional<std::string>("private"); }, true));
+  ASSERT_EQ(::stat(target.c_str(), &metadata), 0);
+  EXPECT_EQ(metadata.st_mode & 0777, 0600);
+  const auto missing = directory / "new.json";
+  ASSERT_TRUE(private_state_file::update_atomic(missing, 1024, update, true, true));
+  ASSERT_EQ(::stat(missing.c_str(), &metadata), 0);
+  EXPECT_EQ(metadata.st_mode & 0777, 0600);
+}
+#endif
+
+TEST_F(PrivateStateFileTest, SamePayloadUpdateStillRequiresDurableReplacement) {
+  ASSERT_TRUE(private_state_file::write_atomic(target, "same"));
+  const auto unchanged = [](const auto &read) { return std::optional<std::string>(read.payload); };
+  private_state_file::set_write_fault_for_tests(private_state_file::write_fault_e::sync);
+  EXPECT_EQ(private_state_file::update_atomic(target, 1024, unchanged).status,
+            private_state_file::write_status_e::not_committed);
+  private_state_file::set_write_fault_for_tests(private_state_file::write_fault_e::post_rename_durability);
+  EXPECT_EQ(private_state_file::update_atomic(target, 1024, unchanged).status,
+            private_state_file::write_status_e::durability_uncertain);
+  private_state_file::set_write_fault_for_tests(private_state_file::write_fault_e::none);
+  EXPECT_EQ(private_state_file::update_atomic(target, 1024, unchanged).status,
+            private_state_file::write_status_e::committed);
+  EXPECT_EQ(private_state_file::read_secure(target, 1024).payload, "same");
+}

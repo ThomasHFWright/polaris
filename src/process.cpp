@@ -2171,7 +2171,8 @@ namespace proc {
     bool quiesce_session_owned_steam_app_before_native_shutdown(
       const proc::ctx_t &app,
       std::string_view session_instance_id,
-      const boost::process::v1::environment &env
+      const boost::process::v1::environment &env,
+      profile_writer_cleanup_t *profile_cleanup = nullptr
     );
 
     template<typename Request, typename Wait>
@@ -2580,8 +2581,13 @@ namespace proc {
 
     bool terminate_session_owned_steam_app_lineage(
       const proc::ctx_t &app,
-      std::string_view session_instance_id
+      std::string_view session_instance_id,
+      profile_writer_cleanup_t *profile_cleanup = nullptr
     ) {
+      if (profile_cleanup && profile_cleanup->captured) {
+        return terminate_pidfds(profile_cleanup->handles, 0s, 2s, "retained game profile writers"sv);
+      }
+      if (profile_cleanup && std::any_of(profile_cleanup->handles.begin(), profile_cleanup->handles.end(), pidfd_has_exited)) return false;
       const auto appid = steam_appid_for_context(app);
       if (appid.empty()) {
         return true;
@@ -2598,9 +2604,17 @@ namespace proc {
       }
 
       const auto app_root_pid = roots.roots.front().pid;
-      std::vector<pidfd_handle_t> frozen;
+      std::vector<pidfd_handle_t> local_frozen;
+      auto &frozen = profile_cleanup ? profile_cleanup->handles : local_frozen;
       std::set<pid_t> captured;
+      for (const auto &handle : frozen) {
+        // An incomplete prior attempt resumed these processes. Stop them again
+        // before treating their descendants as a stable capture boundary.
+        if (!send_pidfd_signal(handle, SIGSTOP)) return false;
+        captured.emplace(handle.pid);
+      }
       for (auto &root : roots.roots) {
+        if (captured.contains(root.pid)) continue;
         if (!send_pidfd_signal(root, SIGSTOP)) {
           return false;
         }
@@ -2688,6 +2702,16 @@ namespace proc {
         return false;
       }
 
+      if (profile_cleanup) {
+        // Keep the complete closure frozen until exit. A SIGTERM handler could
+        // fork a new writer after capture; restoration cannot race that fork.
+        profile_cleanup->captured = true;
+        resume_on_failure.disable();
+        for (const auto &handle : frozen) {
+          if (!send_pidfd_signal(handle, SIGKILL)) return false;
+        }
+        return wait_for_pidfds_exit(frozen, private_steam_app_sigkill_timeout);
+      }
       for (const auto &handle : frozen) {
         if (!send_pidfd_signal(handle, SIGTERM)) {
           return false;
@@ -2719,8 +2743,12 @@ namespace proc {
       bool session_owned_cage,
       std::string_view session_instance_id,
       const boost::process::v1::environment &env,
-      private_steam_graceful_shutdown_request_t request_graceful_shutdown
+      private_steam_graceful_shutdown_request_t request_graceful_shutdown,
+      profile_writer_cleanup_t *profile_cleanup = nullptr
     ) {
+      const bool require_app_quiescence = profile_cleanup != nullptr;
+      if (profile_cleanup && !profile_cleanup->handles.empty() &&
+          !terminate_session_owned_steam_app_lineage(app, session_instance_id, profile_cleanup)) return false;
       const bool steam_context = context_uses_steam(app);
       if (!session_owned_cage || session_instance_id.empty() || !steam_context) {
         return false;
@@ -2742,6 +2770,10 @@ namespace proc {
                              << ownership.unowned.size() << " active Steam client process(es) are not session-owned"sv;
         } else if (ownership.owned_count() == 0) {
           BOOST_LOG(info) << "process: skipping pre-cage private Steam termination because no session-owned Steam client is active"sv;
+        }
+        if (require_app_quiescence && ownership.capture_complete && ownership.owned_count() == 0) {
+          const auto app_roots = private_steam_app_root_snapshot(session_instance_id, steam_appid_for_context(app));
+          return app_roots.capture_complete && app_roots.roots.empty();
         }
         return false;
       }
@@ -2772,7 +2804,8 @@ namespace proc {
         const bool app_quiescent = quiesce_session_owned_steam_app_before_native_shutdown(
           app,
           session_instance_id,
-          env
+          env,
+          profile_cleanup
         );
         if (app_quiescent) {
           BOOST_LOG(info) << "process: requesting session-owned Steam native shutdown after exact app quiescence"sv;
@@ -2799,6 +2832,7 @@ namespace proc {
                                << "falling back to exact pidfd SIGKILL"sv;
           }
         } else {
+          if (require_app_quiescence) return false;
           BOOST_LOG(warning) << "process: private Steam app did not reach verified quiescence; "sv
                              << "skipping native shutdown and falling back to exact pidfd SIGKILL"sv;
         }
@@ -2855,17 +2889,27 @@ namespace proc {
       const std::string &steam_appid,
       std::string_view session_instance_id,
       std::vector<pidfd_handle_t> *frozen_generation = nullptr,
-      unsigned capture_pass = 0
+      unsigned capture_pass = 0,
+      profile_writer_cleanup_t *profile_cleanup = nullptr
     ) {
+      if (profile_cleanup && profile_cleanup->captured) {
+        return terminate_pidfds(profile_cleanup->handles, 0s, 2s, "retained game profile Gamescope writers"sv);
+      }
+      if (profile_cleanup && capture_pass == 0 &&
+          std::any_of(profile_cleanup->handles.begin(), profile_cleanup->handles.end(), pidfd_has_exited)) return false;
       struct snapshot_t {
         std::vector<pidfd_handle_t> targets;
         bool capture_complete = true;
       } snapshot;
       std::vector<pidfd_handle_t> owned_frozen_generation;
-      auto &frozen = frozen_generation ? *frozen_generation : owned_frozen_generation;
+      auto &frozen = profile_cleanup ? profile_cleanup->handles :
+                     frozen_generation ? *frozen_generation : owned_frozen_generation;
       std::set<pid_t> authorized_private_groups;
       std::set<pid_t> freeze_groups;
-      auto resume_on_failure = util::fail_guard([&frozen, &freeze_groups]() {
+      auto resume_on_failure = util::fail_guard([&frozen, &freeze_groups, profile_cleanup]() {
+        // Every recursive frame shares the committed closure. Once committed,
+        // no outer guard may resume survivors of a partial termination.
+        if (profile_cleanup && profile_cleanup->captured) return;
         for (const auto group : freeze_groups) {
           (void) kill(-group, SIGCONT);
         }
@@ -3111,12 +3155,17 @@ namespace proc {
           steam_appid,
           session_instance_id,
           &frozen,
-          capture_pass + 1
+          capture_pass + 1,
+          profile_cleanup
         );
       }
 
       if (frozen.empty()) {
         return false;
+      }
+      if (profile_cleanup) {
+        profile_cleanup->captured = true;
+        resume_on_failure.disable();
       }
       BOOST_LOG(info) << "process: terminating frozen exact-generation closure of "sv
                       << frozen.size() << " process(es)"sv;
@@ -4329,8 +4378,12 @@ namespace proc {
     bool quiesce_session_owned_steam_app_before_native_shutdown(
       const proc::ctx_t &app,
       std::string_view session_instance_id,
-      const boost::process::v1::environment &env
+      const boost::process::v1::environment &env,
+      profile_writer_cleanup_t *profile_cleanup
     ) {
+      if (profile_cleanup && profile_cleanup->captured) {
+        return terminate_session_owned_steam_app_lineage(app, session_instance_id, profile_cleanup);
+      }
       const auto appid = steam_appid_for_context(app);
       if (appid.empty()) {
         return true;
@@ -4347,7 +4400,7 @@ namespace proc {
         return false;
       }
       if (!roots_before.roots.empty() &&
-          !terminate_session_owned_steam_app_lineage(app, session_instance_id)) {
+          !terminate_session_owned_steam_app_lineage(app, session_instance_id, profile_cleanup)) {
         return false;
       }
       if (!wait_for_steam_app_stopped_event(log_path, log_snapshot, appid)) {
@@ -6478,6 +6531,122 @@ namespace proc {
     }
   }
 
+#ifdef POLARIS_TESTS
+  static thread_local bool forced_profile_group_capture_failure = false;
+#endif
+
+  // Game and infrastructure descendants must stop before restoring settings;
+  // a successful parent exit alone does not prove the process group stopped.
+  static bool game_profile_group_stopped(boost::process::v1::group &group, bool signal) {
+    if (!group.valid()) return true;
+#ifdef POLARIS_TESTS
+    if (forced_profile_group_capture_failure) return false;
+#endif
+    auto native_group = group.native_handle();
+    if (signal && group.joinable()) {
+      std::error_code ec;
+      group.terminate(ec);
+#ifdef __linux__
+      // Boost invalidates grp even if killpg fails. Preserve it for observation;
+      // detach prevents a later destructor/retry from signaling a recycled PGID.
+      group = boost::process::v1::group(native_group);
+#endif
+      group.detach();
+    }
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
+    do {
+#ifdef __linux__
+      // waitpid(-pgid) only observes our direct children, not surviving grandchildren.
+      bool running = false;
+      bool complete = true;
+      DIR *dir = opendir("/proc");
+      if (!dir) return false;
+      errno = 0;
+      while (auto *entry = read_next_proc_entry(dir)) {
+        if (!proc_pid_dir_name(entry->d_name)) continue;
+        const auto pid = static_cast<pid_t>(std::strtol(entry->d_name, nullptr, 10));
+        const auto stat = read_proc_status_file_result(pid, "stat");
+        if (!stat.ok()) {
+          if (!process_vanished_during_proc_read(stat.error)) complete = false;
+          continue;
+        }
+        const auto end = stat.bytes.rfind(')');
+        if (end == std::string::npos) { complete = false; continue; }
+        std::istringstream fields(stat.bytes.substr(end + 1));
+        char state;
+        pid_t parent, pgid;
+        if (!(fields >> state >> parent >> pgid)) { complete = false; continue; }
+        if (pgid == native_group && state != 'Z' && state != 'X') running = true;
+      }
+      if (errno != 0) complete = false;
+      closedir(dir);
+      if (complete && !running) { group.detach(); group = boost::process::v1::group(); return true; }
+#else
+      if (!platf::process_group_running((std::uintptr_t) group.native_handle())) {
+        group.detach();
+        return true;
+      }
+#endif
+      std::this_thread::sleep_for(10ms);
+    } while (std::chrono::steady_clock::now() < deadline);
+    return false;
+  }
+
+#ifdef POLARIS_TESTS
+  bool game_profile_group_stopped_for_tests(boost::process::v1::group &group, bool signal) {
+    return game_profile_group_stopped(group, signal);
+  }
+#endif
+
+  template<class Environment>
+  std::string parse_env_val(Environment &env, const std::string_view &val_raw);
+
+  bool proc_t::apply_game_profile(const rtsp_stream::launch_session_t &session, bool private_runtime) {
+    if (_pending_game_profile) return false;
+    if (!session.paired_app_launch || session.input_only || session.watch_only) return true;
+    const auto *profile = game_profiles::select(_app.game_profiles, session.unique_id, session.width, session.height, session.fps);
+    if (!profile) return true;
+    confighttp::emit_session_event("game_profile", "Selected game profile '" + profile->name + "' (" +
+      std::to_string(session.width) + "x" + std::to_string(session.height) + "@" + format_session_fps(session.fps) +
+      " FPS, " + (profile->client_uuid.empty() ? "any paired client" : "client-specific") + ", " +
+      (profile->fps_millihertz ? "resolution+FPS" : profile->width ? "resolution" : "no mode condition") + ")");
+    if (profile->settings.empty()) return true;
+    if (!private_runtime && !_app.cmd.empty() && !_app.detached.empty()) {
+      confighttp::emit_session_event("error", "Game profiles require a main command or detached commands, not both, outside a private runtime");
+      return false;
+    }
+    auto resolved = *profile;
+    try {
+      const std::filesystem::path path = parse_env_val(_env, resolved.file);
+      if (!path.is_absolute()) throw std::invalid_argument("Settings file must be an absolute path");
+      resolved.file = std::filesystem::canonical(path).string();
+    } catch (const std::exception &error) {
+      confighttp::emit_session_event("error", "Game settings file could not be resolved: " + std::string(error.what()));
+      return false;
+    }
+    auto &pending = _pending_game_profile.emplace(pending_game_profile_t {});
+    std::string error;
+    if (game_profiles::apply(resolved, pending.settings, error)) return true;
+    confighttp::emit_session_event("error", "Game settings profile '" + profile->name + "': " + error);
+    if (pending.settings.backup.empty()) _pending_game_profile.reset();
+    return false;
+  }
+
+  bool proc_t::cleanup_game_profile(bool writers_stopped) {
+    if (!_pending_game_profile) return true;
+    auto &pending = *_pending_game_profile;
+    pending.cleanup_started = true;
+    pending.writers_stopped = pending.writers_stopped || writers_stopped;
+    if (!pending.writers_stopped) return false;
+    std::string error;
+    if (!game_profiles::restore(pending.settings, error)) {
+      confighttp::emit_session_event("error", "Game settings restoration failed: " + error);
+      return false;
+    }
+    _pending_game_profile.reset();
+    return true;
+  }
+
   boost::filesystem::path find_working_directory(const std::string &cmd, const boost::process::v1::environment &env) {
     // Parse the raw command string into parts to get the actual command portion
 #ifdef _WIN32
@@ -6696,6 +6865,7 @@ namespace proc {
       bool exact_private_refresh_reapply_will_run) {
     auto &sync = session_lifecycle_sync();
     std::lock_guard<std::recursive_mutex> lifecycle_lock(sync.mutex);
+    if (_pending_game_profile && _pending_game_profile->cleanup_started) return 422;
     if (_app_id == 0 || _app.uuid.empty() || !_launch_session || !launch_session) return 503;
     if (launch_session->watch_only) {
       // A viewer attaches to the already-running capture generation. Pin its
@@ -7070,6 +7240,11 @@ namespace proc {
       terminate_impl(false, false);
     }
 
+    if (_pending_game_profile) {
+      confighttp::emit_session_event("error", "Game settings restoration remains pending; launch refused");
+      return 422;
+    }
+
 #ifdef __linux__
     if (linux_desktop_takeover && linux_desktop_takeover->active) {
       BOOST_LOG(error) << "process: refusing launch while Desktop Takeover recovery remains incomplete"sv;
@@ -7230,7 +7405,7 @@ namespace proc {
     };
 
     bool session_mode_applied = false;
-    if (!session_mode.empty()) {
+    if (session_devices_enabled && !session_mode.empty()) {
       std::string mode_error;
       bool session_mode_failed =
         !stream_display_policy::selection_valid_fresh(session_mode, mode_error);
@@ -7562,7 +7737,7 @@ namespace proc {
 
     // Portal is_hdr reads this file. Write from final enable_hdr only.
     // Never restart gamescope or rewrite from encoder probe. Session owns restart.
-    {
+    if (session_devices_enabled) {
       const char *rt = std::getenv("XDG_RUNTIME_DIR");
       if (rt && *rt) {
         const auto force_path = std::filesystem::path(rt) / "polaris-gamescope-force";
@@ -7792,15 +7967,20 @@ namespace proc {
     confighttp::set_session_state(confighttp::session_state_e::initializing);
     confighttp::emit_session_event("session_starting", "Preparing streaming session");
 #ifdef __linux__
-    auto session_state = session_manager::save_state();
+    auto session_state = session_devices_enabled ? session_manager::save_state() : session_manager::desktop_state_t {};
 
     // Inhibit lock screen during streaming
-    if (session_manager::inhibit_lock()) {
+    if (session_devices_enabled && session_manager::inhibit_lock()) {
       session_state.lock_inhibited = true;
     }
 
     // Cage start is deferred — it launches with the game command below
 #endif
+
+    // No prep has run yet; early failure must not unwind stale iterators from
+    // the previous app or the list replaced by the nested Gamescope helper.
+    _app_prep_begin = _app.prep_cmds.cbegin();
+    _app_prep_it = _app_prep_begin;
 
     // Executed when returning from function
     auto fg = util::fail_guard([&
@@ -7813,13 +7993,13 @@ namespace proc {
       config::video.color_range = this->initial_color_range;
       config::video.nvenc_tune = this->initial_nvenc_tune;
       terminate_impl(false, true);
-      display_device::revert_configuration();
+      if (session_devices_enabled) display_device::revert_configuration();
 #ifdef __linux__
       confighttp::set_session_state(confighttp::session_state_e::tearing_down);
       confighttp::emit_session_event("session_ending", "Cleaning up");
       // terminate_impl() owns exact-generation cage cleanup. Do not follow it
       // with raw PID/group signaling from stream_runtime::labwc::stop().
-      session_manager::restore_state(session_state);
+      if (session_devices_enabled) session_manager::restore_state(session_state);
 #endif
     });
 
@@ -7939,7 +8119,7 @@ namespace proc {
       }
     }
 
-    display_device::configure_display(config::video, *launch_session);
+    if (session_devices_enabled) display_device::configure_display(config::video, *launch_session);
 
     // We should not preserve display state when using virtual display.
     // It is already handled by Windows properly.
@@ -8060,7 +8240,7 @@ namespace proc {
                       << display_policy.reason << ")"sv;
     }
 
-    display_device::configure_display(config::video, *launch_session);
+    if (session_devices_enabled) display_device::configure_display(config::video, *launch_session);
 
     // Reset persistence when using virtual display (same as Windows behavior)
     if (this->virtual_display) {
@@ -8069,7 +8249,7 @@ namespace proc {
 
 #else
 
-    display_device::configure_display(config::video, *launch_session);
+    if (session_devices_enabled) display_device::configure_display(config::video, *launch_session);
 
 #endif
 
@@ -8126,7 +8306,7 @@ namespace proc {
 #else
     constexpr bool delay_encoder_probe_until_cage = false;
 #endif
-    if (!delay_encoder_probe_until_cage && no_active_sessions_at_launch) {
+    if (session_devices_enabled && !delay_encoder_probe_until_cage && no_active_sessions_at_launch) {
       const bool probe_failed = video::probe_encoders(strict_session_encoder) != 0;
       const bool selection_failed = !probe_failed && !encoder_probe_matches_session();
       if (probe_failed || selection_failed) {
@@ -8292,6 +8472,14 @@ namespace proc {
     _app_prep_begin = std::begin(_app.prep_cmds);
     _app_prep_it = _app_prep_begin;
 
+    if (!apply_game_profile(*launch_session,
+#ifdef __linux__
+                            use_cage_compositor_for_session
+#else
+                            false
+#endif
+                            )) return 422;
+
     for (; _app_prep_it != std::end(_app.prep_cmds); ++_app_prep_it) {
       auto &cmd = *_app_prep_it;
 
@@ -8415,7 +8603,7 @@ namespace proc {
       _session_instance_id
     );
     _audio_context = {};
-    if (config::audio.stream) {
+    if (session_devices_enabled && config::audio.stream) {
       _audio_context = audio::get_audio_ctx_ref();
       if (_audio_context) {
         const auto session_audio_channels = normalized_audio_channel_count(channelCount);
@@ -8960,7 +9148,7 @@ namespace proc {
     });
     start_steam_big_picture_input_guard(_env, steam_guard_snapshot);
 
-    if (has_launch_commands) {
+    if (session_devices_enabled && has_launch_commands) {
       input::preallocate_gamepad();
     }
 
@@ -9368,7 +9556,7 @@ namespace proc {
     fg.disable();
 
 #if defined POLARIS_TRAY && POLARIS_TRAY >= 1
-    system_tray::update_tray_playing(_app.name);
+    if (session_devices_enabled) system_tray::update_tray_playing(_app.name);
 #endif
 
     return 0;
@@ -9862,7 +10050,8 @@ namespace proc {
       _env,
       [this]() {
         return request_session_owned_steam_graceful_shutdown_before_cage_stop();
-      }
+      },
+      _pending_game_profile ? &_pending_game_profile->steam_writers : nullptr
     );
   }
 
@@ -9939,6 +10128,11 @@ namespace proc {
     _exact_generation_cleanup_complete = prior_cleanup_complete &&
                                          isolated_cleanup_complete &&
                                          detached_authority_complete;
+    if (_pending_game_profile && std::exchange(_pending_game_profile->generation_prerequisites_stopped, false)) {
+      // Retry can recover only from this attempt's complete generation capture
+      // after its required Steam/Gamescope writer checks have also succeeded.
+      _exact_generation_cleanup_complete = isolated_cleanup_complete && detached_authority_complete;
+    }
 
     if (!_session_used_cage_compositor) {
       if (!_exact_generation_cleanup_complete) {
@@ -9966,7 +10160,7 @@ namespace proc {
       // reaps the supervisor's private group, and fails closed on its own
       // ownership proof, so it cannot touch anything this session did not
       // spawn.
-      finalize_isolated_session_runtime(false);
+      if (!_pending_game_profile) finalize_isolated_session_runtime(false);
     }
   }
 
@@ -10025,6 +10219,14 @@ namespace proc {
     sync.capture_launch.reset();
     std::error_code ec;
     placebo = false;
+    if (_pending_game_profile) {
+      _pending_game_profile->cleanup_started = true;
+#ifdef __linux__
+      _pending_game_profile->generation_prerequisites_stopped = false;
+#endif
+      immediate = false; // Restoration always requires verified writer shutdown.
+      if (!game_profile_group_stopped(_pending_game_profile->infrastructure_undo_group, false)) return;
+    }
 
     // Function-scoped so the Linux media fence outlives undo cmds. Nesting the
     // fence in an early #ifdef block used to drop it before
@@ -10039,7 +10241,7 @@ namespace proc {
 #ifdef __linux__
     // Single media owner: signal → portal release → bounded front-end wait →
     // terminal ownership fence. Nested kill only after every owned cleanup exits.
-    media_stop.fence = session_media::prepare_for_stop();
+    if (session_devices_enabled) media_stop.fence = session_media::prepare_for_stop();
     stop_steam_big_picture_input_guard();
 
     // Gamescope Steam/pressure-vessel may strip POLARIS_SESSION_INSTANCE_ID.
@@ -10049,11 +10251,15 @@ namespace proc {
       const bool attached_cleanup_complete =
         terminate_gamescope_attached_session_clients(
           steam_appid_for_context(_app),
-          _session_instance_id
+          _session_instance_id,
+          nullptr,
+          0,
+          _pending_game_profile ? &_pending_game_profile->gamescope_writers : nullptr
         );
       _exact_generation_cleanup_complete =
         _exact_generation_cleanup_complete && attached_cleanup_complete;
       if (!attached_cleanup_complete) {
+        if (_pending_game_profile) return;
         // Do not return: owner cancel already answered Moonlight. Aborting here
         // left had_app=true forever (attach Steam bwrap under polaris SID failed
         // the private-session check) so quit looked broken. Fall through so
@@ -10067,13 +10273,18 @@ namespace proc {
     // frozen. Steam cleanup may otherwise destroy the authority needed to prove
     // stripped pressure-vessel descendants.
     if (!immediate) {
-      terminate_session_owned_steam_before_cage_stop();
+      const bool stopped = terminate_session_owned_steam_before_cage_stop();
+      if (_pending_game_profile && _session_used_cage_compositor && context_uses_steam(_app) && !stopped) return;
     }
 
     // The immutable launch generation, not mutable config, owns this cleanup.
     // Keep exact-generation ancestors alive while proving pressure-vessel client
     // ancestry above, then terminate every exact-generation process via pidfds.
+    // The profile barriers above return on either incomplete writer check.
+    // This permits retry, but only the fresh generation capture can prove exit.
+    if (_pending_game_profile) _pending_game_profile->generation_prerequisites_stopped = true;
     terminate_isolated_session_generation();
+    if (_pending_game_profile && !_exact_generation_cleanup_complete) return;
 
     if (_retained_steam_shutdown && !retry_retained_steam_shutdown()) {
       BOOST_LOG(error) << "process: retained Steam singleton shutdown remains incomplete"sv;
@@ -10083,7 +10294,13 @@ namespace proc {
           _session_used_cage_compositor,
           immediate
         )) {
+      auto prior_group = _process_group.native_handle();
       terminate_process_group(_process, _process_group, _app.exit_timeout);
+      if (_pending_game_profile && prior_group != -1 && !_process_group.valid()) {
+        _process_group = boost::process::v1::group(prior_group);
+        _process_group.detach();
+      }
+      if (_pending_game_profile && !game_profile_group_stopped(_process_group, true)) return;
     }
 
     if (isolated_session_detaches_legacy_handles(_session_used_cage_compositor)) {
@@ -10100,6 +10317,7 @@ namespace proc {
 #else
     if (!immediate) {
       terminate_process_group(_process, _process_group, _app.exit_timeout);
+      if (_pending_game_profile && !game_profile_group_stopped(_process_group, true)) return;
     }
 #endif
     _process = boost::process::v1::child();
@@ -10199,6 +10417,7 @@ namespace proc {
         });
         if (!retry_retained_steam_shutdown()) {
           BOOST_LOG(error) << "process: Steam singleton shutdown remains retained for the next stop or launch attempt"sv;
+          if (_pending_game_profile) return;
         }
         continue;
       }
@@ -10222,10 +10441,14 @@ namespace proc {
         undo_output = stderr;
       }
 #endif
-      auto child = platf::run_command(cmd.elevated, true, cmd.undo_cmd, working_dir, _env, undo_output, ec, nullptr);
+      auto *undo_group = _pending_game_profile && critical_nested_session_undo ?
+        &_pending_game_profile->infrastructure_undo_group : nullptr;
+      auto child = platf::run_command(cmd.elevated, true, cmd.undo_cmd, working_dir, _env, undo_output, ec, undo_group);
 
       if (ec) {
         BOOST_LOG(warning) << "System: "sv << ec.message();
+        if (_pending_game_profile && critical_nested_session_undo) return;
+        continue;
       }
 
       const auto undo_timeout = critical_nested_session_undo ?
@@ -10244,10 +10467,22 @@ namespace proc {
                          << undo_timeout.count() << "s; session may need manual recovery"sv;
       }
       auto ret = child.exit_code();
+      if (undo_group) {
+        const bool helpers_stopped = game_profile_group_stopped(*undo_group, true);
+        if (undo_timed_out || ret != 0 || !helpers_stopped) return;
+      }
 
       if (ret != 0) {
         BOOST_LOG(warning) << "Return code ["sv << ret << ']';
       }
+    }
+
+    bool writers_stopped = true;
+#ifdef __linux__
+    writers_stopped = !_retained_steam_shutdown;
+#endif
+    if (!cleanup_game_profile(writers_stopped)) {
+      confighttp::emit_session_event("error", "Game settings restoration remains pending; stop or launch will retry");
     }
 
     for (const auto &key : _session_env_keys) {
@@ -10260,7 +10495,7 @@ namespace proc {
 
     // Disable streaming display after undo commands have run.
     // Skip if a virtual display was created (it will be destroyed below).
-    if (!linux_vdisplay.has_value() || !linux_vdisplay->active) {
+    if (session_devices_enabled && (!linux_vdisplay.has_value() || !linux_vdisplay->active)) {
       linux_display::disable_streaming_display();
     }
     // Explicitly drop after undo so portal reconnect cannot race nested stop /
@@ -10398,6 +10633,8 @@ namespace proc {
     _app_id = -1;
     _app_name.clear();
     _app = {};
+    _app_prep_begin = _app.prep_cmds.cbegin();
+    _app_prep_it = _app_prep_begin;
     display_name.clear();
     capture_generation = {};
     initial_display.clear();
@@ -10427,7 +10664,7 @@ namespace proc {
       _saved_input_config.reset();
     }
 
-    cursor::set_visible(config::input.mouse_cursor_visible);
+    if (session_devices_enabled) cursor::set_visible(config::input.mouse_cursor_visible);
 
     publish_stream_ended_after_terminate_if_needed(has_run);
 
@@ -10448,11 +10685,15 @@ namespace proc {
   void proc_t::reload_configuration(proc_t &&parsed) {
     auto &sync = session_lifecycle_sync();
     std::lock_guard<std::recursive_mutex> lifecycle_lock(sync.mutex);
-    _env = std::move(parsed._env);
+    if (!_pending_game_profile || _pending_game_profile->writers_stopped) _env = std::move(parsed._env);
     _apps = std::move(parsed._apps);
   }
 
 #if defined(POLARIS_TESTS)
+  void proc_t::set_game_profile_capture_failure_for_tests(bool fail) {
+    forced_profile_group_capture_failure = fail;
+  }
+
   void proc_t::set_active_launch_for_tests(
       const ctx_t &app,
       std::shared_ptr<rtsp_stream::launch_session_t> launch_session) {
@@ -11830,6 +12071,14 @@ namespace proc {
           proc::ctx_t ctx;
           ctx.idx = std::to_string(i);
           ctx.uuid = app_node.at("uuid");
+          if (app_node.contains("game-profiles")) {
+            std::string parse_error;
+            if (!game_profiles::parse(app_node["game-profiles"], ctx.game_profiles, parse_error)) {
+              BOOST_LOG(error) << "App unavailable: " << ctx.uuid << ": " << parse_error;
+              ++i;
+              continue;
+            }
+          }
 
           // Build the list of preparation commands.
           std::vector<proc::cmd_t> prep_cmds;

@@ -55,10 +55,75 @@ Saving writes the launcher profile immediately; there is no separate apply step.
 
 | Field | What it does |
 | --- | --- |
-| **Command Preparations** | Commands run before the app starts and undone after the session ends. If any preparation fails, the launch is aborted. |
+| **Command Preparations** | Commands run before the app starts and undone after the session ends. Ordinary preparation failures are logged and launch continues; required session infrastructure and game settings profiles abort on failure. |
 | **Resume/Pause Commands** | The do command runs when the first client connects to an idle app; the undo command runs when the last client disconnects. Clean up in undo what do sets up. |
 | **Global prep and state commands** | Per-app switches that include or exclude the host-wide commands from the General tab for this app. |
 | **Allow client prepare commands** | Whether the commands a paired device carries may run when this app starts. |
+
+### Game settings profiles
+
+For a directly published game, **Game settings profiles** selects one set of native
+settings edits on a new authenticated paired-client launch, before ordinary prep commands
+and the game starter. This works with standard Moonlight; no client changes are needed.
+Web launches, input-only sessions and viewers do not apply profiles. Desktop and Big Picture
+cannot identify games opened inside them.
+
+Initial support is Cyberpunk's `UserSettings.json`. In the editor, enter its host path in
+**Settings file** and a JSON object in **Named option edits (JSON)**. Paths support existing
+launch-environment expansion, such as `$(HOME)`. Use the exact option names from your file;
+each must identify exactly one option within an `options` array. Only existing `value` and
+`index` fields can be edited. Keep each value's existing JSON type (string, number or boolean);
+indices must be nonnegative integers. Check the values and indices in your own file; Polaris
+does not translate graphics presets between games.
+
+For example, the optional `apps.json` field can contain:
+
+```json
+"game-profiles": [
+  {
+    "name": "TV 4K120",
+    "width": 3840, "height": 2160, "fps": 120,
+    "file": "/absolute/path/to/Cyberpunk/UserSettings.json",
+    "settings": {
+      "DLSS": { "value": "Balanced", "index": 3 },
+      "DLSSFrameGen": { "value": true }
+    }
+  }
+]
+```
+
+Names, `file` and `settings` are required. Empty `settings: {}` with `file: ""` is a no-op,
+useful for a specific client or mode that should override a broader profile without edits.
+Nonempty settings require a nonempty file path. Missing profiles or no matching profile
+leave settings alone. Ordinary app prep and state commands remain separate.
+
+All supplied conditions must match. Client-specific rows (`client-uuid`) outrank any-client
+rows; within each group, resolution + FPS outranks resolution alone, then no mode. A row
+without conditions is the default. Selectors use the **final host launch mode**, including
+render resolution after optimization and app/client scaling. Width and height must be
+supplied together as integers from 1 to 32768; FPS requires both and accepts numbers from
+1 to 1000 with up to three decimals. These limits do not expand display or encoder support.
+Profile and launch FPS round to the nearest whole number, with halves rounded up:
+`59.94` → `60`, `119.88` → `120`, `23.976` → `24`, `59.5` → `60`.
+Duplicate selectors after rounding are rejected. UUIDs compare case-insensitively; renaming
+a client preserves assignments, while unpairing/re-pairing requires reassignment. Saved
+unknown UUIDs remain visible as unavailable clients.
+
+Polaris saves a full original backup in a `.polaris-profile.json` sidecar before editing.
+After writer shutdown and existing undo commands, it restores **only the fields it edited**
+into the latest settings file, preserving other in-game changes. The backup persists after
+restoration. Use a regular file owned by the user running Polaris; its file mode is preserved.
+Missing or ambiguous options, missing fields and apply failures abort launch. Failed writer
+cleanup or restoration blocks another apply rather than overwriting unresolved state.
+Outside a private runtime, combining main and detached commands is rejected because writer
+ownership cannot be verified. Pause, reconnect and resume do not switch profiles; restart
+the game to select another one.
+
+An active crash journal blocks apply until manual recovery. After a daemon crash, reboot or
+power loss, stop all game/settings writers and use the saved backup to recover the affected
+fields before resolving that journal; automatic crash recovery is not provided. Polaris
+cannot exclude externally launched games or cloud-sync writers, so avoid concurrent changes
+to the same file while a profile is active.
 
 ### Runtime behavior
 

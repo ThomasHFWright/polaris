@@ -147,11 +147,16 @@ TEST(LinuxStreamContractTests, RootMediaFenceSurvivesThroughCompositorTerminatio
 
   const auto terminate = process.find("void proc_t::terminate_impl(");
   ASSERT_NE(terminate, std::string::npos);
-  const auto body = process.substr(terminate, 4200);
+  const auto terminate_end = process.find("bool proc_t::reload_configuration_from_file(", terminate);
+  ASSERT_NE(terminate_end, std::string::npos);
+  const auto body = process.substr(terminate, terminate_end - terminate);
   // Function-scoped holder so the fence outlives early #ifdef blocks through undo.
   const auto fence = body.find("media_stop.fence = session_media::prepare_for_stop()");
   const auto compositor = body.find("terminate_isolated_session_generation()");
+  const auto release = body.find("media_stop.fence.reset()");
   ASSERT_NE(fence, std::string::npos);
   ASSERT_NE(compositor, std::string::npos);
+  ASSERT_NE(release, std::string::npos);
   EXPECT_LT(fence, compositor);
+  EXPECT_LT(compositor, release);
 }

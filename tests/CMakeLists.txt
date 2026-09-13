@@ -63,6 +63,7 @@ set(TEST_MAIN_SOURCE
 
 set(TEST_SUPPORT_SOURCES
     ${CMAKE_SOURCE_DIR}/src/bounded_log_file.cpp
+    ${CMAKE_SOURCE_DIR}/src/game_profiles.cpp
     ${CMAKE_SOURCE_DIR}/src/confighttp_validation.cpp
     ${CMAKE_SOURCE_DIR}/src/confighttp_benchmark_auth.cpp
     ${CMAKE_SOURCE_DIR}/src/browser_stream_protocol.cpp
@@ -114,6 +115,7 @@ set(TEST_FAST_SOURCES
     ${CMAKE_SOURCE_DIR}/tests/unit/test_bounded_log_file.cpp
     ${CMAKE_SOURCE_DIR}/tests/unit/test_benchmark_control_contract.cpp
     ${CMAKE_SOURCE_DIR}/tests/unit/test_builtin_artwork_contract.cpp
+    ${CMAKE_SOURCE_DIR}/tests/unit/test_game_profiles.cpp
     ${CMAKE_SOURCE_DIR}/tests/unit/test_confighttp_validation.cpp
     ${CMAKE_SOURCE_DIR}/tests/unit/test_confighttp_benchmark_auth.cpp
     ${CMAKE_SOURCE_DIR}/tests/unit/test_cover_download_contract.cpp
@@ -225,6 +227,7 @@ set(TEST_INPUT_SOURCES
 )
 
 set(TEST_CONFIG_SOURCES
+    ${CMAKE_SOURCE_DIR}/tests/unit/test_game_profile_lifecycle.cpp
     ${CMAKE_SOURCE_DIR}/tests/unit/test_config_parser.cpp
     ${CMAKE_SOURCE_DIR}/tests/unit/test_device_db.cpp
     ${CMAKE_SOURCE_DIR}/tests/unit/test_launch_profile.cpp

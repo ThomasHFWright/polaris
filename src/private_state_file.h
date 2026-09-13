@@ -47,9 +47,10 @@ namespace private_state_file {
   // One cross-process transaction. Contention fails immediately so callers can
   // retain session authority without waiting on an unrelated file-lock holder.
   // The callback must not call another persistence operation on this path.
+  // Opt-in preserves existing POSIX rwx bits on the temporary inode before rename.
   write_result_t update_atomic(const std::filesystem::path &target, std::size_t max_bytes,
     const std::function<std::optional<std::string>(const read_result_t &)> &update,
-    bool permit_public_read = false);
+    bool permit_public_read = false, bool preserve_permissions = false);
 
   write_result_t write_atomic(const std::filesystem::path &target, std::string_view payload);
 

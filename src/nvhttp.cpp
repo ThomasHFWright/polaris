@@ -6145,6 +6145,7 @@ namespace nvhttp {
           }
         } catch (...) {}
 
+        launch_session->paired_app_launch = true;
         auto err = proc::proc.execute_and_raise(*app_iter, launch_session, [&]() {
           return publish_authorized_launch(named_cert_p, perm, [&]() {
             return proc::proc.raise_session_for_admitted_launch(launch_session);
@@ -6155,7 +6156,9 @@ namespace nvhttp {
           tree.put("root.<xmlattr>.status_code", err);
           tree.put(
             "root.<xmlattr>.status_message",
-            err == 503
+            err == 422
+            ? "Game preparation failed or cleanup remains pending; see the host session log"
+            : err == 503
             ? "Video capture or encoding could not start. If prompted, approve screen sharing on the host."
             : (err == 401 || err == 403 || err == 409)
               ? "Authorization or session state changed during launch; reconnect to retry"

@@ -3,6 +3,7 @@
  * @brief Input validation helpers for Web UI write endpoints.
  */
 #include "confighttp_validation.h"
+#include "game_profiles.h"
 
 #include <algorithm>
 #include <array>
@@ -501,6 +502,11 @@ namespace confighttp::validation {
     if (!payload.is_object()) {
       error = "App payload must be a JSON object";
       return false;
+    }
+
+    if (payload.contains("game-profiles")) {
+      std::vector<game_profiles::profile_t> profiles;
+      if (!game_profiles::parse(payload["game-profiles"], profiles, error)) return false;
     }
 
     constexpr std::array string_keys {
